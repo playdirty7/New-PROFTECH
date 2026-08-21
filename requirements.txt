@@ -1,1 +1,2 @@
-vkbottle
+vk-api
+python-dotenv
