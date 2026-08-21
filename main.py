@@ -2,32 +2,20 @@ import os
 import re
 import random
 import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType  # ← изменён импорт
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
 # --- 1. Конфигурация ---
 VK_TOKEN = os.getenv('VK_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID', 0))
 
-# ID поста, под которым нужно оставить комментарий
 TARGET_POST_ID = 1108
 TARGET_OWNER_ID = -235416787
-
-# ID группы для проверки подписки (можно использовать screen_name 'uralprofteh66' или числовой ID)
-# Для проверки подписки проще использовать screen_name
-GROUP_SCREEN_NAME = 'uralprofteh66'
+GROUP_SCREEN_NAME = 'uralprofteh66'  # или числовой ID, но лучше screen_name
 
 # --- 2. Состояния диалога ---
-# user_sessions[user_id] = {
-#   'step': 0,           # 0 - ожидание подписки, 1 - ожидание имени, 2 - ожидание вуза, 3 - ожидание профессии
-#   'name': '',
-#   'college': '',
-#   'profession': ''
-# }
 user_sessions = {}
 participant_counter = 0
-
-# Файл для сохранения счетчика (чтобы номера не сбрасывались при перезапуске)
 COUNTER_FILE = 'counter.txt'
 
 def load_counter():
@@ -44,14 +32,11 @@ def save_counter():
 
 # --- 3. Клавиатуры ---
 def get_subscription_keyboard():
-    """Клавиатура с кнопками 'Подписаться' (ссылка) и 'Я подписан(а)!' (callback)"""
     keyboard = VkKeyboard(one_time=False, inline=True)
-    # Кнопка-ссылка
     keyboard.add_openlink_button(
         label='Подписаться',
         link=f'https://vk.com/{GROUP_SCREEN_NAME}'
     )
-    # Кнопка для проверки подписки (callback)
     keyboard.add_callback_button(
         label='Я подписан(а)!',
         color=VkKeyboardColor.POSITIVE,
@@ -60,23 +45,21 @@ def get_subscription_keyboard():
     return keyboard
 
 def remove_keyboard():
-    """Пустая клавиатура (убирает кнопки)"""
     return VkKeyboard(one_time=False, inline=True).get_empty_keyboard()
 
-# --- 4. Функция проверки подписки ---
+# --- 4. Проверка подписки ---
 def is_user_subscribed(vk, user_id):
-    """Проверяет, подписан ли пользователь на группу"""
     try:
         response = vk.groups.isMember(
             group_id=GROUP_SCREEN_NAME,
             user_id=user_id
         )
-        return response  # True или False
+        return response
     except Exception as e:
-        print(f"❌ Ошибка при проверке подписки: {e}")
+        print(f'❌ Ошибка проверки подписки: {e}')
         return False
 
-# --- 5. Функция для отправки комментария под постом ---
+# --- 5. Отправка комментария ---
 def post_comment(vk, profession, number):
     comment_text = f'{profession} – новый участник лотереи "Первый студенческий"! Порядковый номер: {number}'
     try:
@@ -87,35 +70,30 @@ def post_comment(vk, profession, number):
         )
         print(f'✅ Комментарий отправлен: {comment_text}')
     except Exception as e:
-        print(f'❌ Ошибка при отправке комментария: {e}')
+        print(f'❌ Ошибка комментария: {e}')
 
 # --- 6. Основная логика ---
 def main():
     global participant_counter
-
     load_counter()
 
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
-    longpoll = VkLongPoll(vk_session)
+    longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)  # ← изменено
 
-    print('🤖 Бот запущен и ждет сообщений...')
+    print('🤖 Бот запущен (BotLongPoll)...')
 
     for event in longpoll.listen():
-        # Обработка обычных сообщений
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            user_id = event.user_id
-            message_text = event.text.lower().strip()
+        # --- Обработка обычных сообщений ---
+        if event.type == VkBotEventType.MESSAGE_NEW:
+            user_id = event.object.message.from_id
+            message_text = event.object.message.text.lower().strip()
 
-            # --- Проверка на команду "Первый студенческий" ---
             trigger_pattern = re.compile(r'(первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого)')
             is_trigger = bool(trigger_pattern.search(message_text))
 
             if is_trigger:
-                # Начинаем новый диалог
                 user_sessions[user_id] = {'step': 0, 'name': '', 'college': '', 'profession': ''}
-
-                # Отправляем приветственное сообщение с клавиатурой
                 vk.messages.send(
                     user_id=user_id,
                     message='Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее "Первый студенческий", подпишись на наше сообщество.',
@@ -124,14 +102,12 @@ def main():
                 )
                 continue
 
-            # --- Обработка сообщений в рамках диалога (после подписки) ---
             if user_id in user_sessions:
                 session = user_sessions[user_id]
                 step = session['step']
 
                 if step == 1:
-                    # Сохраняем имя
-                    session['name'] = event.text
+                    session['name'] = event.object.message.text
                     vk.messages.send(
                         user_id=user_id,
                         message='Где ты учишься?',
@@ -141,8 +117,7 @@ def main():
                     session['step'] = 2
 
                 elif step == 2:
-                    # Сохраняем учебное заведение
-                    session['college'] = event.text
+                    session['college'] = event.object.message.text
                     vk.messages.send(
                         user_id=user_id,
                         message='Какую профессию ты осваиваешь?',
@@ -151,15 +126,11 @@ def main():
                     session['step'] = 3
 
                 elif step == 3:
-                    # Сохраняем профессию
-                    session['profession'] = event.text
-
-                    # Присваиваем порядковый номер
+                    session['profession'] = event.object.message.text
                     participant_counter += 1
                     save_counter()
                     user_number = participant_counter
 
-                    # Отправляем финальное сообщение
                     final_message = (
                         f'Поздравляю, ты в Уральском Профтехе! 🔥\n\n'
                         f'Твой персональный номер участника лотереи – {user_number}. '
@@ -173,48 +144,31 @@ def main():
                         random_id=random.randint(1, 2**31)
                     )
 
-                    # Отправляем комментарий под постом
                     post_comment(vk, session['profession'], user_number)
-
-                    # Удаляем сессию
                     del user_sessions[user_id]
 
         # --- Обработка нажатий на callback-кнопки ---
-        elif event.type == VkEventType.MESSAGE_EVENT:
-            user_id = event.user_id
+        elif event.type == VkBotEventType.MESSAGE_EVENT:
+            user_id = event.object.user_id
             payload = event.object.payload
 
-            # Проверяем, что это наша кнопка
             if payload.get('type') == 'check_subscription':
                 if is_user_subscribed(vk, user_id):
-                    # Пользователь подписан — переходим к вопросу
-                    if user_id in user_sessions:
-                        session = user_sessions[user_id]
-                        # Проверяем, что мы ещё на шаге 0 (ожидание подписки)
-                        if session['step'] == 0:
-                            session['step'] = 1
-                            vk.messages.send(
-                                user_id=user_id,
-                                message='Отлично! А теперь скажи, как тебя зовут?',
-                                random_id=random.randint(1, 2**31),
-                                keyboard=remove_keyboard()
-                            )
-                        else:
-                            # Если шаг не 0 — игнорируем или отправляем сообщение
-                            vk.messages.send(
-                                user_id=user_id,
-                                message='Ты уже прошёл этот этап!',
-                                random_id=random.randint(1, 2**31)
-                            )
-                    else:
-                        # Если сессии нет — возможно, бот перезапустился
+                    if user_id in user_sessions and user_sessions[user_id]['step'] == 0:
+                        user_sessions[user_id]['step'] = 1
                         vk.messages.send(
                             user_id=user_id,
-                            message='Напиши "Первый студенческий", чтобы начать заново.',
+                            message='Отлично! А теперь скажи, как тебя зовут?',
+                            random_id=random.randint(1, 2**31),
+                            keyboard=remove_keyboard()
+                        )
+                    else:
+                        vk.messages.send(
+                            user_id=user_id,
+                            message='Ты уже прошёл этот этап!',
                             random_id=random.randint(1, 2**31)
                         )
                 else:
-                    # Пользователь не подписан
                     vk.messages.send(
                         user_id=user_id,
                         message='Тебя всё ещё нет в числе наших подписчиков 😔',
@@ -222,7 +176,7 @@ def main():
                         keyboard=get_subscription_keyboard().get_keyboard()
                     )
 
-                # Отвечаем на callback (чтобы убрать индикатор загрузки)
+                # Обязательный ответ на событие, чтобы убрать "часики" на кнопке
                 vk.messages.sendMessageEventAnswer(
                     event_id=event.object.event_id,
                     user_id=user_id,
