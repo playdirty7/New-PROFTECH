@@ -6,24 +6,34 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
 # --- 1. Конфигурация ---
-# Токен и ID группы берутся из переменных окружения, которые мы зададим на Bothost
 VK_TOKEN = os.getenv('VK_TOKEN')
-GROUP_ID = int(os.getenv('GROUP_ID', 0))  # ID вашей группы VK
+GROUP_ID = int(os.getenv('GROUP_ID', 0))
 
-# ID поста, под которым нужно оставить комментарий
-TARGET_POST_ID = 1108  # из ссылки vk.ru/wall-235416787_1108
-TARGET_OWNER_ID = -235416787  # Отрицательный ID для группы
+TARGET_POST_ID = 1108
+TARGET_OWNER_ID = -235416787
 
 # --- 2. Состояния диалога ---
-# Словарь для хранения временных данных пользователей
-# Ключ: user_id, Значение: {'step': 0, 'name': '', 'college': '', 'profession': ''}
 user_sessions = {}
-# Счетчик для порядковых номеров
 participant_counter = 0
 
-# --- 3. Функция для отправки комментария под постом ---
+# --- 3. Хранение уже завершивших участников ---
+PARTICIPANTS_FILE = 'participants.txt'
+participants = set()
+
+def load_participants():
+    global participants
+    if os.path.exists(PARTICIPANTS_FILE):
+        with open(PARTICIPANTS_FILE, 'r') as f:
+            participants = set(line.strip() for line in f if line.strip())
+    else:
+        participants = set()
+
+def save_participant(user_id):
+    with open(PARTICIPANTS_FILE, 'a') as f:
+        f.write(str(user_id) + '\n')
+
+# --- 4. Функция для отправки комментария ---
 def post_comment(vk, profession, number):
-    """Отправляет комментарий под указанным постом."""
     comment_text = f"{profession} – новый участник лотереи \"Первый студенческий\"! Порядковый номер: {number}"
     try:
         vk.wall.createComment(
@@ -35,11 +45,12 @@ def post_comment(vk, profession, number):
     except Exception as e:
         print(f"❌ Ошибка при отправке комментария: {e}")
 
-# --- 4. Обработка сообщений ---
+# --- 5. Основная логика ---
 def main():
-    global participant_counter
+    global participant_counter, participants
 
-    # Инициализация VK API
+    load_participants()
+
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
     longpoll = VkLongPoll(vk_session)
@@ -51,14 +62,30 @@ def main():
             user_id = event.user_id
             message_text = event.text.lower().strip()
 
-            # --- 5. Проверка на команду "Первый студенческий" (с вариациями) ---
-            # Регулярное выражение ищет варианты: первый студенческий, 1-й студенческий, первокурсник и т.д.
+            # --- Проверка на команду "Первый студенческий" ---
             trigger_pattern = re.compile(r'(первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого)')
             is_trigger = bool(trigger_pattern.search(message_text))
 
-            # --- 6. Логика диалога ---
             if is_trigger:
-                # Начинаем новый диалог
+                # 1) Проверяем, не участвовал ли уже
+                if user_id in participants:
+                    vk.messages.send(
+                        user_id=user_id,
+                        message="Вы уже участвуете в лотерее! Следите за обновлениями 😉",
+                        random_id=random.randint(1, 2**31)
+                    )
+                    continue
+
+                # 2) Проверяем, не начат ли уже диалог (чтобы не сбить)
+                if user_id in user_sessions:
+                    vk.messages.send(
+                        user_id=user_id,
+                        message="Вы уже начали участие, пожалуйста, ответьте на вопросы.",
+                        random_id=random.randint(1, 2**31)
+                    )
+                    continue
+
+                # 3) Начинаем новый диалог
                 user_sessions[user_id] = {'step': 0, 'name': '', 'college': '', 'profession': ''}
                 vk.messages.send(
                     user_id=user_id,
@@ -70,14 +97,15 @@ def main():
                     message="Как тебя зовут?",
                     random_id=random.randint(1, 2**31)
                 )
-                user_sessions[user_id]['step'] = 1  # Ожидаем имя
+                user_sessions[user_id]['step'] = 1
+                continue
 
-            elif user_id in user_sessions:
+            # --- Обработка шагов диалога ---
+            if user_id in user_sessions:
                 session = user_sessions[user_id]
                 step = session['step']
 
                 if step == 1:
-                    # Сохраняем имя
                     session['name'] = event.text
                     vk.messages.send(
                         user_id=user_id,
@@ -87,7 +115,6 @@ def main():
                     session['step'] = 2
 
                 elif step == 2:
-                    # Сохраняем учебное заведение
                     session['college'] = event.text
                     vk.messages.send(
                         user_id=user_id,
@@ -97,14 +124,11 @@ def main():
                     session['step'] = 3
 
                 elif step == 3:
-                    # Сохраняем профессию
                     session['profession'] = event.text
 
-                    # Присваиваем порядковый номер
                     participant_counter += 1
                     user_number = participant_counter
 
-                    # Отправляем финальное сообщение
                     final_message = (
                         f"Поздравляю, ты в Уральском Профтехе! 🔥\n\n"
                         f"Твой персональный номер участника лотереи – {user_number}. "
@@ -118,13 +142,14 @@ def main():
                         random_id=random.randint(1, 2**31)
                     )
 
-                    # --- 7. Отправка комментария под постом ---
                     post_comment(vk, session['profession'], user_number)
 
-                    # Удаляем сессию пользователя, так как диалог завершен
-                    del user_sessions[user_id]
+                    # --- Сохраняем участника ---
+                    participants.add(user_id)
+                    save_participant(user_id)
 
-            # Игнорируем все остальные сообщения
+                    # Удаляем сессию
+                    del user_sessions[user_id]
 
 if __name__ == '__main__':
     main()
