@@ -147,7 +147,7 @@ def main():
                         random_id=random.randint(1, 2**31)
                     )
 
-                    post_comment(vk, session['profession'], user_number)
+                    post_comment(vk, session['name'], session['college'], session['profession'], user_number)
 
                     # --- Сохраняем участника ---
                     participants.add(user_id)
