@@ -1,9 +1,10 @@
 import os
 import asyncio
 import logging
+import re
 from datetime import datetime
 
-from vkbottle import Bot, BotLabeler, CtxStorage
+from vkbottle import Bot
 from vkbottle.types import Message
 import aiosqlite
 
@@ -19,15 +20,11 @@ TARGET_OWNER_ID = -235416787
 
 # --- Инициализация бота ---
 bot = Bot(token=VK_TOKEN)
-labeler = BotLabeler()
-bot.labeler = labeler
-ctx_storage = CtxStorage()
 
 # --- Работа с базой данных ---
 DB_PATH = 'participants.db'
 
 async def init_db():
-    """Создание таблиц, если их нет"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             CREATE TABLE IF NOT EXISTS participants (
@@ -123,7 +120,7 @@ async def post_comment_with_retry(name: str, college: str, profession: str, numb
 
 # --- Обработчики сообщений ---
 
-@labeler.private_message(regex=r'первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого')
+@bot.on.message(text=re.compile(r'первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого', re.IGNORECASE))
 async def start_dialog(message: Message):
     user_id = message.from_id
 
@@ -140,7 +137,7 @@ async def start_dialog(message: Message):
         "Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее \"Первый студенческий\", ответь на 3 вопроса.\n\nКак тебя зовут?"
     )
 
-@labeler.private_message(func=lambda message: message.from_id in user_sessions)
+@bot.on.message(func=lambda message: message.from_id in user_sessions)
 async def dialog_step(message: Message):
     user_id = message.from_id
     session = user_sessions[user_id]
@@ -191,6 +188,7 @@ async def dialog_step(message: Message):
 async def main():
     await init_db()
     await refresh_cache()
+    logger.info("🤖 Бот запущен и ждет сообщений...")
     await bot.run_polling()
 
 if __name__ == '__main__':
