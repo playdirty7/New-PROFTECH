@@ -3,13 +3,12 @@ import re
 import random
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
 # --- 1. Конфигурация ---
 VK_TOKEN = os.getenv('VK_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID', 0))
 
-TARGET_POST_ID = 1325
+TARGET_POST_ID = 1108
 TARGET_OWNER_ID = -235416787
 
 # --- 2. Состояния диалога ---
@@ -32,7 +31,7 @@ def save_participant(user_id):
     with open(PARTICIPANTS_FILE, 'a') as f:
         f.write(str(user_id) + '\n')
 
-# --- 4. Функция для отправки комментария ---
+# --- 4. Функция для отправки комментария (новый формат) ---
 def post_comment(vk, name, college, profession, number):
     comment_text = (
         f"{name} - новый участник лотереи! \n"
@@ -64,7 +63,8 @@ def main():
 
     for event in longpoll.listen():
         if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            user_id = event.user_id
+            # Исправление: используем event.message.from_id вместо event.user_id
+            user_id = event.message.from_id
             message_text = event.text.lower().strip()
 
             # --- Проверка на команду "Первый студенческий" ---
@@ -72,16 +72,14 @@ def main():
             is_trigger = bool(trigger_pattern.search(message_text))
 
             if is_trigger:
-                # 1) Проверяем, не участвовал ли уже
                 if user_id in participants:
                     vk.messages.send(
                         user_id=user_id,
-                        message="Ты уже участвуешь в лотерее! Следи за обновлениями 😉",
+                        message="Вы уже участвуете в лотерее! Следите за обновлениями 😉",
                         random_id=random.randint(1, 2**31)
                     )
                     continue
 
-                # 2) Проверяем, не начат ли уже диалог (чтобы не сбить)
                 if user_id in user_sessions:
                     vk.messages.send(
                         user_id=user_id,
@@ -90,7 +88,6 @@ def main():
                     )
                     continue
 
-                # 3) Начинаем новый диалог
                 user_sessions[user_id] = {'step': 0, 'name': '', 'college': '', 'profession': ''}
                 vk.messages.send(
                     user_id=user_id,
@@ -137,7 +134,7 @@ def main():
                     final_message = (
                         f"Поздравляю, ты в Уральском Профтехе! 🔥\n\n"
                         f"Твой персональный номер участника лотереи – {user_number}. "
-                        f"В качестве подтверждения участия комментарий с порядковым номером АВТОМАТИЧЕСКИ появится под постом с акцией (ничего самостоятельно писать не нужно). "
+                        f"В качестве подтверждения участия комментарий с порядковым номером автоматически появится под постом с акцией. "
                         f"Остался один шаг: поделись акцией с другом, чтобы и он успел заявить о себе!\n\n"
                         f"Удачи! 🤞"
                     )
@@ -149,11 +146,9 @@ def main():
 
                     post_comment(vk, session['name'], session['college'], session['profession'], user_number)
 
-                    # --- Сохраняем участника ---
                     participants.add(user_id)
                     save_participant(user_id)
 
-                    # Удаляем сессию
                     del user_sessions[user_id]
 
 if __name__ == '__main__':
