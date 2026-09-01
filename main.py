@@ -1,160 +1,230 @@
 import os
-import re
-import random
-import vk_api
-from vk_api.longpoll import VkLongPoll, VkEventType
-from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+import asyncio
+import logging
+from datetime import datetime
+from typing import Optional
 
-# --- 1. Конфигурация ---
+from vkbottle import Bot, Message
+from vkbottle.bot import BotLabeler, Message
+from vkbottle.dispatch.rules import ABCRule
+from vkbottle import CtxStorage
+from vkbottle import Keyboard, KeyboardButtonColor, Text
+
+import aiosqlite
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Конфигурация ---
 VK_TOKEN = os.getenv('VK_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID', 0))
-
-TARGET_POST_ID = 1325
+TARGET_POST_ID = 1108
 TARGET_OWNER_ID = -235416787
 
-# --- 2. Состояния диалога ---
+# --- Инициализация бота ---
+bot = Bot(token=VK_TOKEN)
+labeler = BotLabeler()
+ctx_storage = CtxStorage()
+
+# --- Работа с базой данных ---
+DB_PATH = 'participants.db'
+
+async def init_db():
+    """Создание таблиц, если их нет"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS participants (
+                user_id INTEGER PRIMARY KEY,
+                number INTEGER UNIQUE,
+                name TEXT,
+                college TEXT,
+                profession TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS counter (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_number INTEGER DEFAULT 0
+            )
+        ''')
+        # Инициализация счётчика, если пусто
+        await db.execute('''
+            INSERT OR IGNORE INTO counter (id, last_number) VALUES (1, 0)
+        ''')
+        await db.commit()
+
+async def is_participant(user_id: int) -> bool:
+    """Проверка, участвовал ли пользователь"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT 1 FROM participants WHERE user_id = ?', (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def add_participant(user_id: int, name: str, college: str, profession: str) -> int:
+    """
+    Добавление участника, возвращает его порядковый номер.
+    Использует транзакцию для атомарного получения и инкремента счётчика.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('BEGIN IMMEDIATE'):
+            # Получаем текущий номер
+            cur = await db.execute('SELECT last_number FROM counter WHERE id = 1')
+            row = await cur.fetchone()
+            new_number = row[0] + 1 if row else 1
+            # Обновляем счётчик
+            await db.execute('UPDATE counter SET last_number = ? WHERE id = 1', (new_number,))
+            # Добавляем участника
+            await db.execute(
+                'INSERT INTO participants (user_id, number, name, college, profession) VALUES (?, ?, ?, ?, ?)',
+                (user_id, new_number, name, college, profession)
+            )
+            await db.commit()
+            return new_number
+
+# --- Кеш участников в памяти (для быстрой проверки) ---
+participants_cache = set()
+cache_updated = None
+
+async def refresh_cache():
+    """Обновление кеша из БД"""
+    global participants_cache, cache_updated
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id FROM participants') as cursor:
+            rows = await cursor.fetchall()
+            participants_cache = {row[0] for row in rows}
+            cache_updated = datetime.now()
+
+async def is_participant_cached(user_id: int) -> bool:
+    """Быстрая проверка с кешем (обновляется раз в 5 секунд)"""
+    global cache_updated
+    if cache_updated is None or (datetime.now() - cache_updated).seconds > 5:
+        await refresh_cache()
+    return user_id in participants_cache
+
+# --- FSM состояния ---
+class States:
+    WAITING_NAME = 1
+    WAITING_COLLEGE = 2
+    WAITING_PROFESSION = 3
+
+# --- Хранилище данных сессии (временное) ---
+# Используем CtxStorage или просто словарь с блокировкой, но для асинхронности лучше использовать кеш vkbottle.
+# Здесь будем хранить данные в словаре с блокировкой, или можно использовать встроенный CtxStorage.
+# Для простоты используем словарь, но для многопоточности asyncio проблем нет.
 user_sessions = {}
-participant_counter = 0
 
-# --- 3. Хранение уже завершивших участников ---
-PARTICIPANTS_FILE = 'participants.txt'
-participants = set()
-
-def load_participants():
-    global participants
-    if os.path.exists(PARTICIPANTS_FILE):
-        with open(PARTICIPANTS_FILE, 'r') as f:
-            participants = set(line.strip() for line in f if line.strip())
-    else:
-        participants = set()
-
-def save_participant(user_id):
-    with open(PARTICIPANTS_FILE, 'a') as f:
-        f.write(str(user_id) + '\n')
-
-# --- 4. Функция для отправки комментария ---
-def post_comment(vk, name, college, profession, number):
+# --- Функция отправки комментария с повторными попытками ---
+async def post_comment_with_retry(name: str, college: str, profession: str, number: int, max_retries=3):
+    """Отправка комментария на стену с повторными попытками при ошибках"""
     comment_text = (
         f"{name} - новый участник лотереи! \n"
         f"Порядковый номер: {number}\n"
         f"Специальность: {profession}\n"
         f"Учебное заведение: {college}"
     )
-    try:
-        vk.wall.createComment(
-            owner_id=TARGET_OWNER_ID,
-            post_id=TARGET_POST_ID,
-            message=comment_text
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.api.wall.create_comment(
+                owner_id=TARGET_OWNER_ID,
+                post_id=TARGET_POST_ID,
+                message=comment_text
+            )
+            logger.info(f"✅ Комментарий отправлен (попытка {attempt}): {comment_text}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отправке комментария (попытка {attempt}): {e}")
+            if attempt == max_retries:
+                logger.error("❌ Все попытки отправки комментария исчерпаны.")
+                return False
+            await asyncio.sleep(2 ** attempt)  # экспоненциальная задержка
+    return False
+
+# --- Обработчики сообщений ---
+
+@labeler.private_message(text=[r'первый\s*студенческий', r'1-?й\s*студенческий', r'первокурсник', r'студент\s*первого'], lower=True)
+async def start_dialog(message: Message):
+    user_id = message.from_id
+
+    # Проверка участия через кеш
+    if await is_participant_cached(user_id):
+        await message.answer("Вы уже участвуете в лотерее! Следите за обновлениями 😉")
+        return
+
+    # Проверка, не начат ли уже диалог
+    if user_id in user_sessions:
+        await message.answer("Вы уже начали участие, пожалуйста, ответьте на вопросы.")
+        return
+
+    # Инициализация сессии
+    user_sessions[user_id] = {'step': States.WAITING_NAME, 'name': '', 'college': '', 'profession': ''}
+    await message.answer(
+        "Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее \"Первый студенческий\", ответь на 3 вопроса.\n\nКак тебя зовут?"
+    )
+
+@labeler.private_message(func=lambda message: message.from_id in user_sessions)
+async def dialog_step(message: Message):
+    user_id = message.from_id
+    session = user_sessions[user_id]
+    step = session['step']
+    text = message.text.strip()
+
+    if step == States.WAITING_NAME:
+        session['name'] = text
+        session['step'] = States.WAITING_COLLEGE
+        await message.answer("Где ты учишься?")
+    elif step == States.WAITING_COLLEGE:
+        session['college'] = text
+        session['step'] = States.WAITING_PROFESSION
+        await message.answer("Какую профессию ты осваиваешь?")
+    elif step == States.WAITING_PROFESSION:
+        session['profession'] = text
+
+        # Добавляем участника в БД и получаем номер
+        try:
+            number = await add_participant(user_id, session['name'], session['college'], session['profession'])
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении участника: {e}")
+            await message.answer("Произошла ошибка, попробуйте позже.")
+            del user_sessions[user_id]
+            return
+
+        # Отправляем финальное сообщение
+        final_message = (
+            f"Поздравляю, ты в Уральском Профтехе! 🔥\n\n"
+            f"Твой персональный номер участника лотереи – {number}. "
+            f"В качестве подтверждения участия комментарий с порядковым номером автоматически появится под постом с акцией. "
+            f"Остался один шаг: поделись акцией с другом, чтобы и он успел заявить о себе!\n\n"
+            f"Удачи! 🤞"
         )
-        print(f"✅ Комментарий отправлен: {comment_text}")
-    except Exception as e:
-        print(f"❌ Ошибка при отправке комментария: {e}")
+        await message.answer(final_message)
 
-# --- 5. Основная логика ---
-def main():
-    global participant_counter, participants
+        # Отправляем комментарий (асинхронно, чтобы не задерживать ответ)
+        asyncio.create_task(
+            post_comment_with_retry(
+                session['name'],
+                session['college'],
+                session['profession'],
+                number
+            )
+        )
 
-    load_participants()
+        # Обновляем кеш асинхронно
+        asyncio.create_task(refresh_cache())
 
-    vk_session = vk_api.VkApi(token=VK_TOKEN)
-    vk = vk_session.get_api()
-    longpoll = VkLongPoll(vk_session)
+        # Удаляем сессию
+        del user_sessions[user_id]
 
-    print("🤖 Бот запущен и ждет сообщений...")
+# Запуск бота
+async def main():
+    await init_db()
+    await refresh_cache()  # заполняем кеш при старте
 
-    for event in longpoll.listen():
-        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            user_id = event.user_id
-            message_text = event.text.lower().strip()
+    # Подключаем лейблер
+    bot.labeler = labeler
 
-            # --- Проверка на команду "Первый студенческий" ---
-            trigger_pattern = re.compile(r'(первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого)')
-            is_trigger = bool(trigger_pattern.search(message_text))
-
-            if is_trigger:
-                # 1) Проверяем, не участвовал ли уже
-                if user_id in participants:
-                    vk.messages.send(
-                        user_id=user_id,
-                        message="Ты уже участвуешь в лотерее! Следи за обновлениями 😉",
-                        random_id=random.randint(1, 2**31)
-                    )
-                    continue
-
-                # 2) Проверяем, не начат ли уже диалог (чтобы не сбить)
-                if user_id in user_sessions:
-                    vk.messages.send(
-                        user_id=user_id,
-                        message="Вы уже начали участие, пожалуйста, ответьте на вопросы.",
-                        random_id=random.randint(1, 2**31)
-                    )
-                    continue
-
-                # 3) Начинаем новый диалог
-                user_sessions[user_id] = {'step': 0, 'name': '', 'college': '', 'profession': ''}
-                vk.messages.send(
-                    user_id=user_id,
-                    message="Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее \"Первый студенческий\", ответь на 3 вопроса.",
-                    random_id=random.randint(1, 2**31)
-                )
-                vk.messages.send(
-                    user_id=user_id,
-                    message="Как тебя зовут?",
-                    random_id=random.randint(1, 2**31)
-                )
-                user_sessions[user_id]['step'] = 1
-                continue
-
-            # --- Обработка шагов диалога ---
-            if user_id in user_sessions:
-                session = user_sessions[user_id]
-                step = session['step']
-
-                if step == 1:
-                    session['name'] = event.text
-                    vk.messages.send(
-                        user_id=user_id,
-                        message="Где ты учишься?",
-                        random_id=random.randint(1, 2**31)
-                    )
-                    session['step'] = 2
-
-                elif step == 2:
-                    session['college'] = event.text
-                    vk.messages.send(
-                        user_id=user_id,
-                        message="Какую профессию ты осваиваешь?",
-                        random_id=random.randint(1, 2**31)
-                    )
-                    session['step'] = 3
-
-                elif step == 3:
-                    session['profession'] = event.text
-
-                    participant_counter += 1
-                    user_number = participant_counter
-
-                    final_message = (
-                        f"Поздравляю, ты в Уральском Профтехе! 🔥\n\n"
-                        f"Твой персональный номер участника лотереи – {user_number}. "
-                        f"В качестве подтверждения участия комментарий с порядковым номером АВТОМАТИЧЕСКИ появится под постом с акцией (ничего самостоятельно писать не нужно). "
-                        f"Остался один шаг: поделись акцией с другом, чтобы и он успел заявить о себе!\n\n"
-                        f"Удачи! 🤞"
-                    )
-                    vk.messages.send(
-                        user_id=user_id,
-                        message=final_message,
-                        random_id=random.randint(1, 2**31)
-                    )
-
-                    post_comment(vk, session['name'], session['college'], session['profession'], user_number)
-
-                    # --- Сохраняем участника ---
-                    participants.add(user_id)
-                    save_participant(user_id)
-
-                    # Удаляем сессию
-                    del user_sessions[user_id]
+    # Запускаем longpoll
+    await bot.run_polling()
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
