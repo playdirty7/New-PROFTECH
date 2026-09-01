@@ -1,32 +1,41 @@
 import os
-import asyncio
-import logging
 import re
+import random
+import threading
+import sqlite3
+import time
 from datetime import datetime
 
-from vkbottle import Bot
-from vkbottle.types import Message
-import aiosqlite
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import vk_api
+from vk_api.longpoll import VkLongPoll, VkEventType
 
 # --- Конфигурация ---
 VK_TOKEN = os.getenv('VK_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID', 0))
+
 TARGET_POST_ID = 1108
 TARGET_OWNER_ID = -235416787
 
-# --- Инициализация бота ---
-bot = Bot(token=VK_TOKEN)
+# --- Глобальные блокировки ---
+counter_lock = threading.Lock()
+db_lock = threading.Lock()
 
-# --- Работа с базой данных ---
+# --- Кеш участников (периодически обновляется) ---
+participants_cache = set()
+cache_updated = None
+cache_lock = threading.Lock()
+
+# --- Хранилище сессий (словарь, защищённый блокировкой) ---
+user_sessions = {}
+sessions_lock = threading.Lock()
+
+# --- Подключение к БД (создание таблиц) ---
 DB_PATH = 'participants.db'
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
             CREATE TABLE IF NOT EXISTS participants (
                 user_id INTEGER PRIMARY KEY,
                 number INTEGER UNIQUE,
@@ -36,65 +45,58 @@ async def init_db():
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        await db.execute('''
+        c.execute('''
             CREATE TABLE IF NOT EXISTS counter (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 last_number INTEGER DEFAULT 0
             )
         ''')
-        await db.execute('''
-            INSERT OR IGNORE INTO counter (id, last_number) VALUES (1, 0)
-        ''')
-        await db.commit()
+        c.execute('INSERT OR IGNORE INTO counter (id, last_number) VALUES (1, 0)')
+        conn.commit()
 
-async def is_participant(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT 1 FROM participants WHERE user_id = ?', (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def add_participant(user_id: int, name: str, college: str, profession: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('BEGIN IMMEDIATE'):
-            cur = await db.execute('SELECT last_number FROM counter WHERE id = 1')
-            row = await cur.fetchone()
-            new_number = row[0] + 1 if row else 1
-            await db.execute('UPDATE counter SET last_number = ? WHERE id = 1', (new_number,))
-            await db.execute(
-                'INSERT INTO participants (user_id, number, name, college, profession) VALUES (?, ?, ?, ?, ?)',
-                (user_id, new_number, name, college, profession)
-            )
-            await db.commit()
-            return new_number
-
-# --- Кеш участников ---
-participants_cache = set()
-cache_updated = None
-
-async def refresh_cache():
+def refresh_cache():
+    """Обновление кеша из БД"""
     global participants_cache, cache_updated
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id FROM participants') as cursor:
-            rows = await cursor.fetchall()
-            participants_cache = {row[0] for row in rows}
-            cache_updated = datetime.now()
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute('SELECT user_id FROM participants')
+            rows = c.fetchall()
+            with cache_lock:
+                participants_cache = {row[0] for row in rows}
+                cache_updated = datetime.now()
 
-async def is_participant_cached(user_id: int) -> bool:
+def is_participant_cached(user_id):
+    """Проверка с кешем (обновляется раз в 5 секунд)"""
     global cache_updated
-    if cache_updated is None or (datetime.now() - cache_updated).seconds > 5:
-        await refresh_cache()
-    return user_id in participants_cache
+    with cache_lock:
+        if cache_updated is None or (datetime.now() - cache_updated).seconds > 5:
+            refresh_cache()
+        return user_id in participants_cache
 
-# --- FSM состояния ---
-class States:
-    WAITING_NAME = 1
-    WAITING_COLLEGE = 2
-    WAITING_PROFESSION = 3
-
-# --- Хранилище сессий ---
-user_sessions = {}
+def add_participant(user_id, name, college, profession):
+    """Добавление участника, возвращает номер"""
+    with counter_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            with conn:  # автоматическая транзакция
+                c = conn.cursor()
+                # Получаем текущий номер
+                c.execute('SELECT last_number FROM counter WHERE id = 1')
+                row = c.fetchone()
+                new_number = row[0] + 1 if row else 1
+                c.execute('UPDATE counter SET last_number = ? WHERE id = 1', (new_number,))
+                c.execute(
+                    'INSERT INTO participants (user_id, number, name, college, profession) VALUES (?, ?, ?, ?, ?)',
+                    (user_id, new_number, name, college, profession)
+                )
+                conn.commit()
+                # Обновляем кеш
+                with cache_lock:
+                    participants_cache.add(user_id)
+                return new_number
 
 # --- Функция отправки комментария с повторными попытками ---
-async def post_comment_with_retry(name: str, college: str, profession: str, number: int, max_retries=3):
+def post_comment_with_retry(vk, name, college, profession, number, max_retries=3):
     comment_text = (
         f"{name} - новый участник лотереи! \n"
         f"Порядковый номер: {number}\n"
@@ -103,66 +105,88 @@ async def post_comment_with_retry(name: str, college: str, profession: str, numb
     )
     for attempt in range(1, max_retries + 1):
         try:
-            await bot.api.wall.create_comment(
+            vk.wall.createComment(
                 owner_id=TARGET_OWNER_ID,
                 post_id=TARGET_POST_ID,
                 message=comment_text
             )
-            logger.info(f"✅ Комментарий отправлен (попытка {attempt}): {comment_text}")
+            print(f"✅ Комментарий отправлен (попытка {attempt}): {comment_text}")
             return True
         except Exception as e:
-            logger.error(f"❌ Ошибка при отправке комментария (попытка {attempt}): {e}")
+            print(f"❌ Ошибка при отправке комментария (попытка {attempt}): {e}")
             if attempt == max_retries:
-                logger.error("❌ Все попытки отправки комментария исчерпаны.")
+                print("❌ Все попытки исчерпаны.")
                 return False
-            await asyncio.sleep(2 ** attempt)
+            time.sleep(2 ** attempt)  # экспоненциальная задержка
     return False
 
-# --- Обработчики сообщений ---
+# --- Обработка одного сообщения ---
+def handle_message(vk, user_id, message_text):
+    # Проверка на команду запуска
+    trigger_pattern = re.compile(r'(первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого)', re.IGNORECASE)
+    is_trigger = bool(trigger_pattern.search(message_text))
 
-@bot.on.message(text=re.compile(r'первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого', re.IGNORECASE))
-async def start_dialog(message: Message):
-    user_id = message.from_id
-
-    if await is_participant_cached(user_id):
-        await message.answer("Вы уже участвуете в лотерее! Следите за обновлениями 😉")
-        return
-
-    if user_id in user_sessions:
-        await message.answer("Вы уже начали участие, пожалуйста, ответьте на вопросы.")
-        return
-
-    user_sessions[user_id] = {'step': States.WAITING_NAME, 'name': '', 'college': '', 'profession': ''}
-    await message.answer(
-        "Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее \"Первый студенческий\", ответь на 3 вопроса.\n\nКак тебя зовут?"
-    )
-
-@bot.on.message(func=lambda message: message.from_id in user_sessions)
-async def dialog_step(message: Message):
-    user_id = message.from_id
-    session = user_sessions[user_id]
-    step = session['step']
-    text = message.text.strip()
-
-    if step == States.WAITING_NAME:
-        session['name'] = text
-        session['step'] = States.WAITING_COLLEGE
-        await message.answer("Где ты учишься?")
-    elif step == States.WAITING_COLLEGE:
-        session['college'] = text
-        session['step'] = States.WAITING_PROFESSION
-        await message.answer("Какую профессию ты осваиваешь?")
-    elif step == States.WAITING_PROFESSION:
-        session['profession'] = text
-
-        try:
-            number = await add_participant(user_id, session['name'], session['college'], session['profession'])
-        except Exception as e:
-            logger.error(f"Ошибка при добавлении участника: {e}")
-            await message.answer("Произошла ошибка, попробуйте позже.")
-            del user_sessions[user_id]
+    if is_trigger:
+        # Проверка участия
+        if is_participant_cached(user_id):
+            vk.messages.send(
+                user_id=user_id,
+                message="Вы уже участвуете в лотерее! Следите за обновлениями 😉",
+                random_id=random.randint(1, 2**31)
+            )
             return
 
+        with sessions_lock:
+            if user_id in user_sessions:
+                vk.messages.send(
+                    user_id=user_id,
+                    message="Вы уже начали участие, пожалуйста, ответьте на вопросы.",
+                    random_id=random.randint(1, 2**31)
+                )
+                return
+
+            user_sessions[user_id] = {'step': 1, 'name': '', 'college': '', 'profession': ''}
+
+        vk.messages.send(
+            user_id=user_id,
+            message="Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее \"Первый студенческий\", ответь на 3 вопроса.\n\nКак тебя зовут?",
+            random_id=random.randint(1, 2**31)
+        )
+        return
+
+    # Обработка шагов диалога
+    with sessions_lock:
+        if user_id not in user_sessions:
+            return
+        session = user_sessions[user_id]
+        step = session['step']
+
+    if step == 1:
+        session['name'] = message_text
+        session['step'] = 2
+        vk.messages.send(
+            user_id=user_id,
+            message="Где ты учишься?",
+            random_id=random.randint(1, 2**31)
+        )
+    elif step == 2:
+        session['college'] = message_text
+        session['step'] = 3
+        vk.messages.send(
+            user_id=user_id,
+            message="Какую профессию ты осваиваешь?",
+            random_id=random.randint(1, 2**31)
+        )
+    elif step == 3:
+        session['profession'] = message_text
+        name = session['name']
+        college = session['college']
+        profession = session['profession']
+
+        # Добавляем участника (атомарно)
+        number = add_participant(user_id, name, college, profession)
+
+        # Финальное сообщение
         final_message = (
             f"Поздравляю, ты в Уральском Профтехе! 🔥\n\n"
             f"Твой персональный номер участника лотереи – {number}. "
@@ -170,26 +194,44 @@ async def dialog_step(message: Message):
             f"Остался один шаг: поделись акцией с другом, чтобы и он успел заявить о себе!\n\n"
             f"Удачи! 🤞"
         )
-        await message.answer(final_message)
-
-        asyncio.create_task(
-            post_comment_with_retry(
-                session['name'],
-                session['college'],
-                session['profession'],
-                number
-            )
+        vk.messages.send(
+            user_id=user_id,
+            message=final_message,
+            random_id=random.randint(1, 2**31)
         )
 
-        asyncio.create_task(refresh_cache())
-        del user_sessions[user_id]
+        # Отправляем комментарий (в отдельном потоке, чтобы не задерживать ответ)
+        threading.Thread(
+            target=post_comment_with_retry,
+            args=(vk, name, college, profession, number),
+            daemon=True
+        ).start()
 
-# Запуск бота
-async def main():
-    await init_db()
-    await refresh_cache()
-    logger.info("🤖 Бот запущен и ждет сообщений...")
-    await bot.run_polling()
+        # Удаляем сессию
+        with sessions_lock:
+            del user_sessions[user_id]
+
+# --- Основной цикл с многопоточностью ---
+def main():
+    init_db()
+    refresh_cache()
+
+    vk_session = vk_api.VkApi(token=VK_TOKEN)
+    vk = vk_session.get_api()
+    longpoll = VkLongPoll(vk_session)
+
+    print("🤖 Бот запущен и ждет сообщений...")
+
+    for event in longpoll.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            user_id = event.user_id
+            message_text = event.text.strip()
+            # Запускаем обработку в отдельном потоке
+            threading.Thread(
+                target=handle_message,
+                args=(vk, user_id, message_text),
+                daemon=True
+            ).start()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
