@@ -8,7 +8,7 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 VK_TOKEN = os.getenv('VK_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID', 0))
 
-TARGET_POST_ID = 1108
+TARGET_POST_ID = 1325
 TARGET_OWNER_ID = -235416787
 
 # --- 2. Состояния диалога ---
