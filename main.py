@@ -2,14 +2,9 @@ import os
 import asyncio
 import logging
 from datetime import datetime
-from typing import Optional
 
-from vkbottle import Bot, Message
-from vkbottle.bot import BotLabeler, Message
-from vkbottle.dispatch.rules import ABCRule
-from vkbottle import CtxStorage
-from vkbottle import Keyboard, KeyboardButtonColor, Text
-
+from vkbottle import Bot, BotLabeler, CtxStorage
+from vkbottle.types import Message
 import aiosqlite
 
 # Настройка логирования
@@ -25,6 +20,7 @@ TARGET_OWNER_ID = -235416787
 # --- Инициализация бота ---
 bot = Bot(token=VK_TOKEN)
 labeler = BotLabeler()
+bot.labeler = labeler
 ctx_storage = CtxStorage()
 
 # --- Работа с базой данных ---
@@ -49,32 +45,23 @@ async def init_db():
                 last_number INTEGER DEFAULT 0
             )
         ''')
-        # Инициализация счётчика, если пусто
         await db.execute('''
             INSERT OR IGNORE INTO counter (id, last_number) VALUES (1, 0)
         ''')
         await db.commit()
 
 async def is_participant(user_id: int) -> bool:
-    """Проверка, участвовал ли пользователь"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT 1 FROM participants WHERE user_id = ?', (user_id,)) as cursor:
             return await cursor.fetchone() is not None
 
 async def add_participant(user_id: int, name: str, college: str, profession: str) -> int:
-    """
-    Добавление участника, возвращает его порядковый номер.
-    Использует транзакцию для атомарного получения и инкремента счётчика.
-    """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('BEGIN IMMEDIATE'):
-            # Получаем текущий номер
             cur = await db.execute('SELECT last_number FROM counter WHERE id = 1')
             row = await cur.fetchone()
             new_number = row[0] + 1 if row else 1
-            # Обновляем счётчик
             await db.execute('UPDATE counter SET last_number = ? WHERE id = 1', (new_number,))
-            # Добавляем участника
             await db.execute(
                 'INSERT INTO participants (user_id, number, name, college, profession) VALUES (?, ?, ?, ?, ?)',
                 (user_id, new_number, name, college, profession)
@@ -82,12 +69,11 @@ async def add_participant(user_id: int, name: str, college: str, profession: str
             await db.commit()
             return new_number
 
-# --- Кеш участников в памяти (для быстрой проверки) ---
+# --- Кеш участников ---
 participants_cache = set()
 cache_updated = None
 
 async def refresh_cache():
-    """Обновление кеша из БД"""
     global participants_cache, cache_updated
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM participants') as cursor:
@@ -96,7 +82,6 @@ async def refresh_cache():
             cache_updated = datetime.now()
 
 async def is_participant_cached(user_id: int) -> bool:
-    """Быстрая проверка с кешем (обновляется раз в 5 секунд)"""
     global cache_updated
     if cache_updated is None or (datetime.now() - cache_updated).seconds > 5:
         await refresh_cache()
@@ -108,15 +93,11 @@ class States:
     WAITING_COLLEGE = 2
     WAITING_PROFESSION = 3
 
-# --- Хранилище данных сессии (временное) ---
-# Используем CtxStorage или просто словарь с блокировкой, но для асинхронности лучше использовать кеш vkbottle.
-# Здесь будем хранить данные в словаре с блокировкой, или можно использовать встроенный CtxStorage.
-# Для простоты используем словарь, но для многопоточности asyncio проблем нет.
+# --- Хранилище сессий ---
 user_sessions = {}
 
 # --- Функция отправки комментария с повторными попытками ---
 async def post_comment_with_retry(name: str, college: str, profession: str, number: int, max_retries=3):
-    """Отправка комментария на стену с повторными попытками при ошибках"""
     comment_text = (
         f"{name} - новый участник лотереи! \n"
         f"Порядковый номер: {number}\n"
@@ -137,26 +118,23 @@ async def post_comment_with_retry(name: str, college: str, profession: str, numb
             if attempt == max_retries:
                 logger.error("❌ Все попытки отправки комментария исчерпаны.")
                 return False
-            await asyncio.sleep(2 ** attempt)  # экспоненциальная задержка
+            await asyncio.sleep(2 ** attempt)
     return False
 
 # --- Обработчики сообщений ---
 
-@labeler.private_message(text=[r'первый\s*студенческий', r'1-?й\s*студенческий', r'первокурсник', r'студент\s*первого'], lower=True)
+@labeler.private_message(regex=r'первый\s*студенческий|1-?й\s*студенческий|первокурсник|студент\s*первого')
 async def start_dialog(message: Message):
     user_id = message.from_id
 
-    # Проверка участия через кеш
     if await is_participant_cached(user_id):
         await message.answer("Вы уже участвуете в лотерее! Следите за обновлениями 😉")
         return
 
-    # Проверка, не начат ли уже диалог
     if user_id in user_sessions:
         await message.answer("Вы уже начали участие, пожалуйста, ответьте на вопросы.")
         return
 
-    # Инициализация сессии
     user_sessions[user_id] = {'step': States.WAITING_NAME, 'name': '', 'college': '', 'profession': ''}
     await message.answer(
         "Привет! На связи Уральский ПрофТех66 😎 Чтобы участвовать в лотерее \"Первый студенческий\", ответь на 3 вопроса.\n\nКак тебя зовут?"
@@ -180,7 +158,6 @@ async def dialog_step(message: Message):
     elif step == States.WAITING_PROFESSION:
         session['profession'] = text
 
-        # Добавляем участника в БД и получаем номер
         try:
             number = await add_participant(user_id, session['name'], session['college'], session['profession'])
         except Exception as e:
@@ -189,7 +166,6 @@ async def dialog_step(message: Message):
             del user_sessions[user_id]
             return
 
-        # Отправляем финальное сообщение
         final_message = (
             f"Поздравляю, ты в Уральском Профтехе! 🔥\n\n"
             f"Твой персональный номер участника лотереи – {number}. "
@@ -199,7 +175,6 @@ async def dialog_step(message: Message):
         )
         await message.answer(final_message)
 
-        # Отправляем комментарий (асинхронно, чтобы не задерживать ответ)
         asyncio.create_task(
             post_comment_with_retry(
                 session['name'],
@@ -209,21 +184,13 @@ async def dialog_step(message: Message):
             )
         )
 
-        # Обновляем кеш асинхронно
         asyncio.create_task(refresh_cache())
-
-        # Удаляем сессию
         del user_sessions[user_id]
 
 # Запуск бота
 async def main():
     await init_db()
-    await refresh_cache()  # заполняем кеш при старте
-
-    # Подключаем лейблер
-    bot.labeler = labeler
-
-    # Запускаем longpoll
+    await refresh_cache()
     await bot.run_polling()
 
 if __name__ == '__main__':
