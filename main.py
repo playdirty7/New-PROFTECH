@@ -63,8 +63,8 @@ def main():
 
     for event in longpoll.listen():
         if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-            # Исправление: используем event.message.from_id вместо event.user_id
-            user_id = event.message.from_id
+            # Используем peer_id вместо user_id (для личных сообщений это одно и то же)
+            user_id = event.peer_id
             message_text = event.text.lower().strip()
 
             # --- Проверка на команду "Первый студенческий" ---
