@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import random
 import vk_api
@@ -7,10 +6,11 @@ from vk_api.longpoll import VkLongPoll, VkEventType
 
 # --- 1. Конфигурация ---
 VK_TOKEN = os.getenv('VK_TOKEN')
-GROUP_ID = int(os.getenv('GROUP_ID', 0))  # не используется, но оставлено
+if not VK_TOKEN:
+    raise ValueError("Не задан VK_TOKEN в переменных окружения")
 
 # --- 2. Клавиатура с кнопкой "Подписаться" ---
-KEYBOARD = {
+KEYBOARD_JSON = json.dumps({
     "one_time": False,
     "buttons": [
         [
@@ -24,21 +24,21 @@ KEYBOARD = {
             }
         ]
     ]
-}
-KEYBOARD_JSON = json.dumps(KEYBOARD, ensure_ascii=False)
+}, ensure_ascii=False)
 
-# --- 3. Триггеры (регулярное выражение) ---
-TRIGGER_PATTERN = re.compile(
-    r'(привет|'
-    r'1-?й?\s*студенчески?й?|'
-    r'1\s*студент|'
-    r'перв[ыо]й?\s*студен[тч]?е?с?к?и?й?|'
-    r'студент\s*первого|'
-     r'первый\s*студенческий|'
-     r'1\s*студенческий|'
-    r'первокурсник)',
-    re.IGNORECASE
-)
+# --- 3. Триггерные фразы (все в нижнем регистре) ---
+TRIGGER_PHRASES = [
+    "привет",
+    "1 студенческий",
+    "1-й студенческий",
+    "1 студент",
+    "первый студент",
+    "первый студенческий",
+    "первый студенчиский",   # с опечаткой
+    "первый студенеский",    # с опечаткой
+    "студент первого",
+    "первокурсник"
+]
 
 # --- 4. Ответное сообщение ---
 REPLY_MESSAGE = (
@@ -59,9 +59,11 @@ def main():
         if event.type == VkEventType.MESSAGE_NEW and event.to_me:
             user_id = event.peer_id
             message_text = event.text.strip()
+            print(f"📩 Получено сообщение от {user_id}: {message_text}")
 
-            # Проверка триггера
-            if TRIGGER_PATTERN.search(message_text):
+            # Проверяем, содержит ли сообщение хотя бы одну из триггерных фраз (игнорируя регистр)
+            lower_msg = message_text.lower()
+            if any(phrase in lower_msg for phrase in TRIGGER_PHRASES):
                 try:
                     vk.messages.send(
                         user_id=user_id,
